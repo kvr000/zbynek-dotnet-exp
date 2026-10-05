@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.IO;
 using System.Net;
@@ -36,6 +37,7 @@ internal static class Program
 internal sealed class EchoServer : BackgroundService
 {
     private const int Port = 5000;
+    private const int BufferSize = 4096;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -76,11 +78,24 @@ internal sealed class EchoServer : BackgroundService
             using (client)
             {
                 NetworkStream stream = client.GetStream();
-                byte[] buffer = new byte[4096];
-                int read;
-                while ((read = await stream.ReadAsync(buffer, token)) > 0)       // 0 = client closed
+                while (true)
                 {
-                    await stream.WriteAsync(buffer.AsMemory(0, read), token);
+                    // Zero-byte read: waits until data arrives without holding any buffer,
+                    // so idle connections cost no buffer memory.
+                    await stream.ReadAsync(Memory<byte>.Empty, token);
+
+                    byte[] buffer = ArrayPool<byte>.Shared.Rent(BufferSize);   // only while active
+                    try
+                    {
+                        int read = await stream.ReadAsync(buffer, token);      // data is ready: completes at once
+                        if (read == 0)
+                            break;                                             // client closed
+                        await stream.WriteAsync(buffer.AsMemory(0, read), token);
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(buffer);
+                    }
                 }
             }
         }
