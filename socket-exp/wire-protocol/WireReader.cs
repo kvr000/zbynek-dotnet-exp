@@ -12,8 +12,13 @@ namespace WireProtocol;
 public delegate bool SequenceDecoder<TState, T>(ref SequenceReader<byte> reader, TState state, out T value);
 
 /// <summary>
-/// Pull-style protocol reader over a <see cref="PipeReader"/>: each read waits until enough bytes are buffered,
-/// decodes them and consumes them, so protocols are written as plain sequential code.
+/// Protocol reader over a <see cref="PipeReader"/>, in two styles:
+/// <list type="bullet">
+/// <item>Whole messages (fastest): <see cref="ReadMessageAsync{T}"/> runs a synchronous <see cref="MessageParser{T}"/>
+/// over the buffered bytes and retries when more arrive.</item>
+/// <item>Field by field: each <c>Read...Async</c> waits until enough bytes are buffered, decodes them and consumes
+/// them. Simplest for handshakes and large or streamed payloads.</item>
+/// </list>
 /// </summary>
 /// <remarks>
 /// <para>Errors: data that cannot be decoded, or a connection closed in the middle of a value, throw
@@ -26,7 +31,7 @@ public delegate bool SequenceDecoder<TState, T>(ref SequenceReader<byte> reader,
 /// default). <see cref="ReadExactlyAsync"/>, <see cref="ReadBytesAsync"/> and <see cref="SkipAsync"/> consume
 /// incrementally and have no such limit. Not thread-safe: one reader per connection, one read at a time.</para>
 /// </remarks>
-public sealed class WireReader
+public sealed partial class WireReader
 {
     /// <summary>UTF-8 that rejects invalid byte sequences instead of replacing them.</summary>
     public static readonly Encoding StrictUtf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);

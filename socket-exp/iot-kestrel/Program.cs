@@ -2,6 +2,7 @@
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.IO.Pipelines;
 using System.Runtime.InteropServices;
@@ -62,7 +63,18 @@ internal static class Program
         using var term = PosixSignalRegistration.Create(PosixSignal.SIGTERM, _ => Environment.ExitCode = 143);
         using var intr = PosixSignalRegistration.Create(PosixSignal.SIGINT,  _ => Environment.ExitCode = 130);
 
-        app.Lifetime.ApplicationStarted.Register(() => Console.Error.WriteLine($"Listening on port {Port}..."));
+        // Startup time: from OS process creation (runtime load, JIT, config, DI, socket bind) until Kestrel listens.
+        // --exitAfterStart=true stops right away, so tools like hyperfine can time repeated starts.
+        bool exitAfterStart = app.Configuration.GetValue<bool>("exitAfterStart");
+        app.Lifetime.ApplicationStarted.Register(() =>
+        {
+            TimeSpan startup = DateTime.Now - Process.GetCurrentProcess().StartTime;
+            Console.Error.WriteLine($"Listening on port {Port}... (startup {startup.TotalMilliseconds:F0} ms)");
+            if (exitAfterStart)
+            {
+                app.Lifetime.StopApplication();
+            }
+        });
         app.Lifetime.ApplicationStopping.Register(() => Console.Error.WriteLine("Shutting down..."));
         app.Lifetime.ApplicationStopped.Register(() => Console.Error.WriteLine("All connections closed."));
 
@@ -138,11 +150,11 @@ internal sealed class IotHandler : ConnectionHandler
     private async Task<DeviceSession?> LoginAsync(WireReader input, PipeWriter output, string peer, CancellationToken ct)
     {
         // 1. device id
-        if (await input.AtEndAsync())
+        string? deviceId = await input.ReadMessageOrDefaultAsync(ParseDeviceId);
+        if (deviceId == null)
         {
             return null;
         }
-        string deviceId = await input.ReadLengthPrefixedStringAsync(MaxDeviceIdLength, "deviceId");
         if (!keys.TryGetKey(deviceId, out byte[]? key))
         {
             log.LogWarning("{Peer}: unknown device {Device}", peer, deviceId);
@@ -157,13 +169,12 @@ internal sealed class IotHandler : ConnectionHandler
         await output.FlushAsync(ct);
 
         // 3. device time + signature
-        long deviceTime = await input.ReadInt64Async();
-        byte[] signature = await input.ReadLengthPrefixedBytesAsync(MaxSignatureLength, "signature");
-        if (!session.VerifyDeviceResponse(serverSig, deviceTime, signature))
+        LoginResponse response = await input.ReadMessageAsync(ParseLoginResponse);
+        if (!session.VerifyDeviceResponse(serverSig, response.DeviceTime, response.Signature))
         {
             throw new ProtocolException("invalid login signature");
         }
-        session.ClockOffsetMillis = deviceTime - serverTime;
+        session.ClockOffsetMillis = response.DeviceTime - serverTime;
         log.LogInformation("{Peer}: device {Device} logged in, clock offset {Offset} ms",
             peer, deviceId, session.ClockOffsetMillis);
         return session;
@@ -174,42 +185,63 @@ internal sealed class IotHandler : ConnectionHandler
         while (true)
         {
             timeout.CancelAfter(IdleTimeout);
-            if (await input.AtEndAsync())
+            DataMessage? message = await input.ReadMessageOrDefaultAsync(ParseDataMessage);
+            switch (message)
             {
-                return;   // device closed the connection between messages
+                case null:
+                    return;   // device closed the connection between messages
+                case TemperatureMessage temperature:
+                    if (!session.VerifyData(temperature.Samples, temperature.Signature))
+                    {
+                        throw new ProtocolException("invalid data signature");
+                    }
+                    sink.Record(session.DeviceId, session.ClockOffsetMillis, temperature.Samples);
+                    break;
+                default:
+                    throw new InvalidOperationException($"unhandled message {message.GetType().Name}");
             }
-            byte type = await input.ReadByteAsync();
-            if (type != (byte)'T')
-            {
-                throw new ProtocolException($"unknown message type 0x{type:X2}");
-            }
-            uint count = await input.ReadVarUInt32Async();
-            if (count > MaxSamplesPerMessage)
-            {
-                throw new ProtocolException($"too many samples: {count}");
-            }
-            TemperatureSample[] samples = await input.ReadAsync((int)count * SampleSize, DecodeSamples);
-            byte[] signature = await input.ReadLengthPrefixedBytesAsync(MaxSignatureLength, "signature");
-            if (!session.VerifyData(samples, signature))
-            {
-                throw new ProtocolException("invalid data signature");
-            }
-            sink.Record(session.DeviceId, session.ClockOffsetMillis, samples);
         }
     }
 
-    private static TemperatureSample[] DecodeSamples(ReadOnlySequence<byte> data)
+    // ---- message parsers: straight-line code over the buffered bytes, see MessageReader -------------------------
+
+    private static string ParseDeviceId(ref MessageReader reader)
+        => reader.ReadLengthPrefixedString(MaxDeviceIdLength, "deviceId");
+
+    private static LoginResponse ParseLoginResponse(ref MessageReader reader)
+        => new(reader.ReadInt64(), reader.ReadLengthPrefixedBytes(MaxSignatureLength, "signature"));
+
+    /// <summary>Message type byte followed by the type's payload.</summary>
+    private static DataMessage ParseDataMessage(ref MessageReader reader)
     {
-        var samples = new TemperatureSample[data.Length / SampleSize];
-        var reader = new SequenceReader<byte>(data);
+        byte type = reader.ReadByte();
+        return type switch
+        {
+            (byte)'T' => ParseTemperaturePayload(ref reader),
+            _ => throw new ProtocolException($"unsupported message type 0x{type:X2}"),
+        };
+    }
+
+    private static TemperatureMessage ParseTemperaturePayload(ref MessageReader reader)
+    {
+        int count = reader.ReadLength(MaxSamplesPerMessage, "sample count");
+        reader.Require(count * SampleSize);   // all samples buffered before allocating
+        var samples = new TemperatureSample[count];
         for (int i = 0; i < samples.Length; i++)
         {
-            reader.TryReadLittleEndian(out long time);
-            reader.TryReadLittleEndian(out short temperature);
-            samples[i] = new TemperatureSample(time, temperature);
+            samples[i] = new TemperatureSample(reader.ReadInt64(), reader.ReadInt16());
         }
-        return samples;
+        byte[] signature = reader.ReadLengthPrefixedBytes(MaxSignatureLength, "signature");
+        return new TemperatureMessage(samples, signature);
     }
+
+    private sealed record LoginResponse(long DeviceTime, byte[] Signature);
+
+    /// <summary>Base of the messages a device sends after login, one subclass per message type.</summary>
+    private abstract record DataMessage;
+
+    /// <summary>'T': temperature samples.</summary>
+    private sealed record TemperatureMessage(TemperatureSample[] Samples, byte[] Signature) : DataMessage;
 
     /// <summary>Unique, strictly increasing millisecond timestamp, used as the login challenge.</summary>
     private static long NextServerTime()
