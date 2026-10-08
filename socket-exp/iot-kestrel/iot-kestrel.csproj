@@ -10,6 +10,9 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.*" />
   </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../wire-protocol/wire-protocol.csproj" />
+  </ItemGroup>
 
 
 </Project>

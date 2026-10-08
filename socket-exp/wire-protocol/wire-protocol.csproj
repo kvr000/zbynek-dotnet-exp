@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <RootNamespace>WireProtocol</RootNamespace>
+    <AssemblyName>WireProtocol</AssemblyName>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>   <!-- self-explanatory members (ReadInt32Async, ...) need no doc comment -->
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Part of the ASP.NET Core shared framework, but not of the base one: referenced as a package so the library
+         works in plain socket servers and clients too. Kestrel apps use the framework copy. -->
+    <PackageReference Include="System.IO.Pipelines" Version="10.*" />
+  </ItemGroup>
+
+</Project>

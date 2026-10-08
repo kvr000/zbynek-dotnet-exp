@@ -17,6 +17,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using WireProtocol;
 
 // IoT TCP server. Wire format (all integers little-endian, "bytes" = 7-bit varint length + raw bytes,
 // "string" = bytes holding UTF-8):
@@ -80,7 +81,6 @@ internal sealed class IotHandler : ConnectionHandler
     private const int SampleSize = sizeof(long) + sizeof(short);
     private static readonly TimeSpan LoginTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan IdleTimeout = TimeSpan.FromMinutes(10);
-    private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
     private static long lastServerTime;
 
     private readonly DeviceKeyStore keys;
@@ -102,7 +102,7 @@ internal sealed class IotHandler : ConnectionHandler
         // Same token plus a timer: login deadline first, then re-armed as idle timeout before every message.
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(closing);
         timeout.CancelAfter(LoginTimeout);
-        PipeReader input = connection.Transport.Input;
+        var input = new WireReader(connection.Transport.Input, ByteOrder.LittleEndian, timeout.Token);
         PipeWriter output = connection.Transport.Output;
         string peer = connection.RemoteEndPoint?.ToString() ?? connection.ConnectionId;
         log.LogInformation("{Peer} connected", peer);
@@ -132,73 +132,83 @@ internal sealed class IotHandler : ConnectionHandler
         {
             // peer reset the connection
         }
-        finally
-        {
-            session?.Dispose();
-        }
         log.LogInformation("{Peer} {Device} disconnected", peer, session?.DeviceId ?? "-");
     }
 
-    private async Task<DeviceSession?> LoginAsync(PipeReader input, PipeWriter output, string peer, CancellationToken ct)
+    private async Task<DeviceSession?> LoginAsync(WireReader input, PipeWriter output, string peer, CancellationToken ct)
     {
         // 1. device id
-        string? deviceId = await ReadMessageAsync<string>(input, ParseDeviceId, ct);
-        if (deviceId == null)
+        if (await input.AtEndAsync())
         {
             return null;
         }
+        string deviceId = await input.ReadLengthPrefixedStringAsync(MaxDeviceIdLength, "deviceId");
         if (!keys.TryGetKey(deviceId, out byte[]? key))
         {
             log.LogWarning("{Peer}: unknown device {Device}", peer, deviceId);
             return null;
         }
         var session = new DeviceSession(deviceId, key);
-        try
-        {
-            // 2. server time + signature
-            long serverTime = NextServerTime();
-            byte[] serverSig = session.SignServerChallenge(serverTime);
-            WriteLogin(output, serverTime, serverSig);
-            await output.FlushAsync(ct);
 
-            // 3. device time + signature
-            LoginResponse? response = await ReadMessageAsync<LoginResponse>(input, ParseLoginResponse, ct);
-            if (response == null)
-            {
-                throw new ProtocolException("connection closed during login");
-            }
-            if (!session.VerifyDeviceResponse(serverSig, response.DeviceTime, response.Signature))
-            {
-                throw new ProtocolException("invalid login signature");
-            }
-            session.ClockOffsetMillis = response.DeviceTime - serverTime;
-            log.LogInformation("{Peer}: device {Device} logged in, clock offset {Offset} ms",
-                peer, deviceId, session.ClockOffsetMillis);
-            return session;
-        }
-        catch
+        // 2. server time + signature
+        long serverTime = NextServerTime();
+        byte[] serverSig = session.SignServerChallenge(serverTime);
+        WriteLogin(output, serverTime, serverSig);
+        await output.FlushAsync(ct);
+
+        // 3. device time + signature
+        long deviceTime = await input.ReadInt64Async();
+        byte[] signature = await input.ReadLengthPrefixedBytesAsync(MaxSignatureLength, "signature");
+        if (!session.VerifyDeviceResponse(serverSig, deviceTime, signature))
         {
-            session.Dispose();
-            throw;
+            throw new ProtocolException("invalid login signature");
         }
+        session.ClockOffsetMillis = deviceTime - serverTime;
+        log.LogInformation("{Peer}: device {Device} logged in, clock offset {Offset} ms",
+            peer, deviceId, session.ClockOffsetMillis);
+        return session;
     }
 
-    private async Task ReceiveDataAsync(DeviceSession session, PipeReader input, CancellationTokenSource timeout)
+    private async Task ReceiveDataAsync(DeviceSession session, WireReader input, CancellationTokenSource timeout)
     {
         while (true)
         {
             timeout.CancelAfter(IdleTimeout);
-            TemperatureMessage? message = await ReadMessageAsync<TemperatureMessage>(input, ParseTemperature, timeout.Token);
-            if (message == null)
+            if (await input.AtEndAsync())
             {
                 return;   // device closed the connection between messages
             }
-            if (!session.VerifyData(message.Samples, message.Signature))
+            byte type = await input.ReadByteAsync();
+            if (type != (byte)'T')
+            {
+                throw new ProtocolException($"unknown message type 0x{type:X2}");
+            }
+            uint count = await input.ReadVarUInt32Async();
+            if (count > MaxSamplesPerMessage)
+            {
+                throw new ProtocolException($"too many samples: {count}");
+            }
+            TemperatureSample[] samples = await input.ReadAsync((int)count * SampleSize, DecodeSamples);
+            byte[] signature = await input.ReadLengthPrefixedBytesAsync(MaxSignatureLength, "signature");
+            if (!session.VerifyData(samples, signature))
             {
                 throw new ProtocolException("invalid data signature");
             }
-            sink.Record(session.DeviceId, session.ClockOffsetMillis, message.Samples);
+            sink.Record(session.DeviceId, session.ClockOffsetMillis, samples);
         }
+    }
+
+    private static TemperatureSample[] DecodeSamples(ReadOnlySequence<byte> data)
+    {
+        var samples = new TemperatureSample[data.Length / SampleSize];
+        var reader = new SequenceReader<byte>(data);
+        for (int i = 0; i < samples.Length; i++)
+        {
+            reader.TryReadLittleEndian(out long time);
+            reader.TryReadLittleEndian(out short temperature);
+            samples[i] = new TemperatureSample(time, temperature);
+        }
+        return samples;
     }
 
     /// <summary>Unique, strictly increasing millisecond timestamp, used as the login challenge.</summary>
@@ -218,113 +228,27 @@ internal sealed class IotHandler : ConnectionHandler
 
     private static void WriteLogin(PipeWriter output, long serverTime, byte[] signature)
     {
-        Span<byte> span = output.GetSpan(sizeof(long) + 5 + signature.Length);
-        BinaryPrimitives.WriteInt64LittleEndian(span, serverTime);
-        int n = sizeof(long);
-        n += Wire.WriteVarUInt(span[n..], (uint)signature.Length);
-        signature.CopyTo(span[n..]);
-        output.Advance(n + signature.Length);
+        var writer = new WireWriter(output);
+        writer.WriteInt64(serverTime);
+        writer.WriteLengthPrefixedBytes(signature);
     }
-
-    // ---- framing ------------------------------------------------------------------------------------------------
-
-    private delegate T Parser<T>(ref SequenceReader<byte> reader);
-
-    /// <summary>Reads one complete message; returns null if the peer closed the connection before its first byte.</summary>
-    private static async ValueTask<T?> ReadMessageAsync<T>(PipeReader input, Parser<T> parser, CancellationToken ct)
-        where T : class
-    {
-        while (true)
-        {
-            ReadResult result = await input.ReadAsync(ct);   // pooled buffers, no per-connection allocation
-            ReadOnlySequence<byte> buffer = result.Buffer;
-            try
-            {
-                T value = Parse(buffer, parser, out SequencePosition consumed);
-                input.AdvanceTo(consumed);                   // whole message parsed: consume exactly it
-                return value;
-            }
-            catch (IncompleteMessageError)
-            {
-                // not all bytes of the message are buffered yet
-            }
-            if (result.IsCompleted)
-            {
-                input.AdvanceTo(buffer.End);
-                return buffer.IsEmpty ? null : throw new ProtocolException("connection closed mid-message");
-            }
-            input.AdvanceTo(buffer.Start, buffer.End);       // nothing consumed, all examined: wait for more data
-        }
-    }
-
-    // Separate from the async method: SequenceReader is a ref struct.
-    private static T Parse<T>(ReadOnlySequence<byte> buffer, Parser<T> parser, out SequencePosition consumed)
-    {
-        var reader = new SequenceReader<byte>(buffer);
-        T value = parser(ref reader);
-        consumed = reader.Position;
-        return value;
-    }
-
-    private static string ParseDeviceId(ref SequenceReader<byte> reader)
-    {
-        byte[] bytes = Wire.ReadBytes(ref reader, MaxDeviceIdLength, "deviceId");
-        try
-        {
-            return StrictUtf8.GetString(bytes);
-        }
-        catch (DecoderFallbackException)
-        {
-            throw new ProtocolException("deviceId is not valid UTF-8");
-        }
-    }
-
-    private static LoginResponse ParseLoginResponse(ref SequenceReader<byte> reader)
-    {
-        long deviceTime = Wire.ReadInt64(ref reader);
-        byte[] signature = Wire.ReadBytes(ref reader, MaxSignatureLength, "signature");
-        return new LoginResponse(deviceTime, signature);
-    }
-
-    private static TemperatureMessage ParseTemperature(ref SequenceReader<byte> reader)
-    {
-        byte type = Wire.ReadByte(ref reader);
-        if (type != (byte)'T')
-        {
-            throw new ProtocolException($"unknown message type 0x{type:X2}");
-        }
-        uint count = Wire.ReadVarUInt(ref reader);
-        if (count > MaxSamplesPerMessage)
-        {
-            throw new ProtocolException($"too many samples: {count}");
-        }
-        Wire.Require(ref reader, count * SampleSize);   // check before allocating
-        var samples = new TemperatureSample[count];
-        for (int i = 0; i < samples.Length; i++)
-        {
-            samples[i] = new TemperatureSample(Wire.ReadInt64(ref reader), Wire.ReadInt16(ref reader));
-        }
-        byte[] signature = Wire.ReadBytes(ref reader, MaxSignatureLength, "signature");
-        return new TemperatureMessage(samples, signature);
-    }
-
-    private sealed record LoginResponse(long DeviceTime, byte[] Signature);
-
-    private sealed record TemperatureMessage(TemperatureSample[] Samples, byte[] Signature);
 }
 
 internal readonly record struct TemperatureSample(long TimeMillis, short Temperature);
 
 /// <summary>Per-connection authenticated state: device key and the signature chain.</summary>
-internal sealed class DeviceSession : IDisposable
+internal sealed class DeviceSession
 {
-    private readonly IncrementalHash mac;
+    private readonly byte[] key;
+    private readonly ArrayBufferWriter<byte> signed = new();
+    private readonly WireWriter writer;
     private byte[] lastSignature = Array.Empty<byte>();
 
     public DeviceSession(string deviceId, byte[] key)
     {
         DeviceId = deviceId;
-        mac = IncrementalHash.CreateHMAC(HashAlgorithmName.SHA256, key);
+        this.key = key;
+        writer = new WireWriter(signed);
     }
 
     public string DeviceId { get; }
@@ -334,49 +258,40 @@ internal sealed class DeviceSession : IDisposable
 
     public byte[] SignServerChallenge(long serverTime)
     {
-        Span<byte> buf = stackalloc byte[5];
-        mac.AppendData("S"u8);
-        byte[] id = Encoding.UTF8.GetBytes(DeviceId);
-        mac.AppendData(buf[..Wire.WriteVarUInt(buf, (uint)id.Length)]);
-        mac.AppendData(id);
-        AppendInt64(serverTime);
-        return mac.GetHashAndReset();
+        signed.ResetWrittenCount();
+        writer.WriteByte((byte)'S');
+        writer.WriteLengthPrefixedString(DeviceId);
+        writer.WriteInt64(serverTime);
+        return HMACSHA256.HashData(key, signed.WrittenSpan);
     }
 
     public bool VerifyDeviceResponse(byte[] serverSig, long deviceTime, byte[] signature)
     {
-        mac.AppendData("D"u8);
-        mac.AppendData(serverSig);
-        AppendInt64(deviceTime);
+        signed.ResetWrittenCount();
+        writer.WriteByte((byte)'D');
+        writer.WriteBytes(serverSig);
+        writer.WriteInt64(deviceTime);
         return Accept(signature);
     }
 
     public bool VerifyData(TemperatureSample[] samples, byte[] signature)
     {
-        Span<byte> buf = stackalloc byte[sizeof(long) + sizeof(short)];
-        mac.AppendData(lastSignature);
-        mac.AppendData("T"u8);
-        mac.AppendData(buf[..Wire.WriteVarUInt(buf, (uint)samples.Length)]);
+        signed.ResetWrittenCount();
+        writer.WriteBytes(lastSignature);
+        writer.WriteByte((byte)'T');
+        writer.WriteVarUInt32((uint)samples.Length);
         foreach (TemperatureSample s in samples)
         {
-            BinaryPrimitives.WriteInt64LittleEndian(buf, s.TimeMillis);
-            BinaryPrimitives.WriteInt16LittleEndian(buf[sizeof(long)..], s.Temperature);
-            mac.AppendData(buf);
+            writer.WriteInt64(s.TimeMillis);
+            writer.WriteInt16(s.Temperature);
         }
         return Accept(signature);
     }
 
-    private void AppendInt64(long value)
-    {
-        Span<byte> buf = stackalloc byte[sizeof(long)];
-        BinaryPrimitives.WriteInt64LittleEndian(buf, value);
-        mac.AppendData(buf);
-    }
-
-    /// <summary>Finishes the HMAC, compares in constant time and on success advances the chain.</summary>
+    /// <summary>HMACs the signed bytes, compares in constant time and on success advances the chain.</summary>
     private bool Accept(byte[] signature)
     {
-        byte[] expected = mac.GetHashAndReset();
+        byte[] expected = HMACSHA256.HashData(key, signed.WrittenSpan);
         if (!CryptographicOperations.FixedTimeEquals(expected, signature))
         {
             return false;
@@ -384,8 +299,6 @@ internal sealed class DeviceSession : IDisposable
         lastSignature = expected;
         return true;
     }
-
-    public void Dispose() => mac.Dispose();
 }
 
 /// <summary>Device keys from configuration: "Devices": { "&lt;deviceId&gt;": "&lt;base64 HMAC key&gt;" }.</summary>
@@ -422,102 +335,5 @@ internal sealed class TemperatureSink
             DateTimeOffset time = DateTimeOffset.FromUnixTimeMilliseconds(s.TimeMillis - clockOffsetMillis);
             log.LogInformation("{Device} {Time:O} temperature {Temperature}", deviceId, time, s.Temperature);
         }
-    }
-}
-
-/// <summary>
-/// Readers over buffered input. Each throws <see cref="IncompleteMessageError"/> when the buffer ends before the
-/// value does, so parsers are written as straight-line code; the caller retries once more bytes arrive.
-/// </summary>
-internal static class Wire
-{
-    public static void Require(ref SequenceReader<byte> reader, long length)
-    {
-        if (reader.Remaining < length)
-        {
-            throw IncompleteMessageError.Instance;
-        }
-    }
-
-    public static byte ReadByte(ref SequenceReader<byte> reader)
-    {
-        return reader.TryRead(out byte value) ? value : throw IncompleteMessageError.Instance;
-    }
-
-    public static short ReadInt16(ref SequenceReader<byte> reader)
-    {
-        return reader.TryReadLittleEndian(out short value) ? value : throw IncompleteMessageError.Instance;
-    }
-
-    public static long ReadInt64(ref SequenceReader<byte> reader)
-    {
-        return reader.TryReadLittleEndian(out long value) ? value : throw IncompleteMessageError.Instance;
-    }
-
-    /// <summary>7-bit encoded unsigned int (LEB128, as BinaryWriter.Write7BitEncodedInt).</summary>
-    public static uint ReadVarUInt(ref SequenceReader<byte> reader)
-    {
-        uint value = 0;
-        for (int shift = 0; shift < 35; shift += 7)
-        {
-            byte b = ReadByte(ref reader);
-            if (shift == 28 && b > 0x0F)
-            {
-                break;
-            }
-            value |= (uint)(b & 0x7F) << shift;
-            if ((b & 0x80) == 0)
-            {
-                return value;
-            }
-        }
-        throw new ProtocolException("varint overflow");
-    }
-
-    public static byte[] ReadBytes(ref SequenceReader<byte> reader, int maxLength, string what)
-    {
-        uint length = ReadVarUInt(ref reader);
-        if (length > maxLength)
-        {
-            throw new ProtocolException($"{what} too long: {length}");
-        }
-        Require(ref reader, length);
-        byte[] bytes = new byte[length];
-        reader.TryCopyTo(bytes);
-        reader.Advance(length);
-        return bytes;
-    }
-
-    public static int WriteVarUInt(Span<byte> destination, uint value)
-    {
-        int i = 0;
-        while (value >= 0x80)
-        {
-            destination[i++] = (byte)(value | 0x80);
-            value >>= 7;
-        }
-        destination[i++] = (byte)value;
-        return i;
-    }
-}
-
-/// <summary>
-/// Not a failure: the buffered input ends before the message does. Thrown by <see cref="Wire"/> readers and caught
-/// only by the framing loop, which then waits for more data and re-parses the message from its first byte.
-/// One shared instance: it carries no state and is never seen outside the framing loop.
-/// </summary>
-internal sealed class IncompleteMessageError : Exception
-{
-    public static readonly IncompleteMessageError Instance = new();
-
-    private IncompleteMessageError() : base("incomplete message")
-    {
-    }
-}
-
-internal sealed class ProtocolException : Exception
-{
-    public ProtocolException(string message) : base(message)
-    {
     }
 }
