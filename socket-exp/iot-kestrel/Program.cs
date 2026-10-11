@@ -24,18 +24,19 @@ using WireProtocol;
 // "string" = bytes holding UTF-8):
 //
 //   Login
-//     1. device -> server:  string deviceId
-//     2. server -> device:  int64 serverTimeMillis, bytes serverSig
-//     3. device -> server:  int64 deviceTimeMillis, bytes deviceSig
-//   Temperature data (repeated after login)
-//     device -> server:     'T', varint count, count * { int64 timeMillis, int16 temperature }, bytes sig
+//     device -> server:  'L', string deviceId, int64 deviceTimeMillis, bytes deviceSig
+//     server -> device:  'l', string deviceId, int64 serverTimeMillis, byte success (0/1), bytes serverSig
+//   Temperature data (repeated after a successful login; the device waits for the login response first)
+//     device -> server:  'T', varint count, count * { int64 timeMillis, int16 temperature }, bytes sig
 //
-// Signatures are HMAC-SHA256 with the per-device key, chained so each covers the whole history of the session:
-//     serverSig = HMAC(K, 'S' || string deviceId || int64 serverTime)
-//     deviceSig = HMAC(K, 'D' || serverSig || int64 deviceTime)
-//     dataSig_n = HMAC(K, prevSig || 'T' || varint count || samples)      prevSig = deviceSig, then dataSig_n-1
-// serverTime is unique per server process, so it doubles as the login challenge: a recorded deviceSig cannot be
-// replayed, and chaining prevents replaying, reordering or dropping data messages within a session.
+// Signatures are HMAC-SHA256 with the per-device key over the message's own bytes, chained so each covers the
+// whole history of the session:
+//     deviceSig = HMAC(K, 'L' || string deviceId || int64 deviceTime)
+//     serverSig = HMAC(K, deviceSig || 'l' || string deviceId || int64 serverTime || byte success)
+//     dataSig_n = HMAC(K, prevSig || 'T' || varint count || samples)      prevSig = serverSig, then dataSig_n-1
+// A failed login gets success=0, signed if the device is known (empty signature otherwise), then the connection
+// closes. serverTime is unique per server process, so a replayed login gets a new serverSig and the recorded data
+// signatures no longer verify; chaining also prevents replaying, reordering or dropping data messages.
 internal static class Program
 {
     private const int Port = 5000;
@@ -149,34 +150,29 @@ internal sealed class IotHandler : ConnectionHandler
 
     private async Task<DeviceSession?> LoginAsync(WireReader input, PipeWriter output, string peer, CancellationToken ct)
     {
-        // 1. device id
-        string? deviceId = await input.ReadMessageOrDefaultAsync(ParseDeviceId);
-        if (deviceId == null)
+        LoginMessage? login = await input.ReadMessageOrDefaultAsync(ParseLoginMessage);
+        if (login == null)
         {
             return null;
         }
-        if (!keys.TryGetKey(deviceId, out byte[]? key))
-        {
-            log.LogWarning("{Peer}: unknown device {Device}", peer, deviceId);
-            return null;
-        }
-        var session = new DeviceSession(deviceId, key);
-
-        // 2. server time + signature
         long serverTime = NextServerTime();
-        byte[] serverSig = session.SignServerChallenge(serverTime);
-        WriteLogin(output, serverTime, serverSig);
-        await output.FlushAsync(ct);
-
-        // 3. device time + signature
-        LoginResponse response = await input.ReadMessageAsync(ParseLoginResponse);
-        if (!session.VerifyDeviceResponse(serverSig, response.DeviceTime, response.Signature))
+        if (!keys.TryGetKey(login.DeviceId, out byte[]? key))
+        {
+            log.LogWarning("{Peer}: unknown device {Device}", peer, login.DeviceId);
+            await WriteLoginResponseAsync(output, login.DeviceId, serverTime, false, Array.Empty<byte>(), ct);
+            return null;
+        }
+        var session = new DeviceSession(login.DeviceId, key);
+        bool success = session.VerifyLogin(login.DeviceTime, login.Signature);
+        byte[] serverSig = session.SignLoginResponse(login.Signature, serverTime, success);
+        await WriteLoginResponseAsync(output, login.DeviceId, serverTime, success, serverSig, ct);
+        if (!success)
         {
             throw new ProtocolException("invalid login signature");
         }
-        session.ClockOffsetMillis = response.DeviceTime - serverTime;
+        session.ClockOffsetMillis = login.DeviceTime - serverTime;
         log.LogInformation("{Peer}: device {Device} logged in, clock offset {Offset} ms",
-            peer, deviceId, session.ClockOffsetMillis);
+            peer, login.DeviceId, session.ClockOffsetMillis);
         return session;
     }
 
@@ -205,11 +201,19 @@ internal sealed class IotHandler : ConnectionHandler
 
     // ---- message parsers: straight-line code over the buffered bytes, see MessageReader -------------------------
 
-    private static string ParseDeviceId(ref MessageReader reader)
-        => reader.ReadLengthPrefixedString(MaxDeviceIdLength, "deviceId");
-
-    private static LoginResponse ParseLoginResponse(ref MessageReader reader)
-        => new(reader.ReadInt64(), reader.ReadLengthPrefixedBytes(MaxSignatureLength, "signature"));
+    /// <summary>'L': the first message of a connection.</summary>
+    private static LoginMessage ParseLoginMessage(ref MessageReader reader)
+    {
+        byte type = reader.ReadByte();
+        if (type != (byte)'L')
+        {
+            throw new ProtocolException($"expected login message, got type 0x{type:X2}");
+        }
+        return new LoginMessage(
+            reader.ReadLengthPrefixedString(MaxDeviceIdLength, "deviceId"),
+            reader.ReadInt64(),
+            reader.ReadLengthPrefixedBytes(MaxSignatureLength, "signature"));
+    }
 
     /// <summary>Message type byte followed by the type's payload.</summary>
     private static DataMessage ParseDataMessage(ref MessageReader reader)
@@ -235,7 +239,7 @@ internal sealed class IotHandler : ConnectionHandler
         return new TemperatureMessage(samples, signature);
     }
 
-    private sealed record LoginResponse(long DeviceTime, byte[] Signature);
+    private sealed record LoginMessage(string DeviceId, long DeviceTime, byte[] Signature);
 
     /// <summary>Base of the messages a device sends after login, one subclass per message type.</summary>
     private abstract record DataMessage;
@@ -243,7 +247,7 @@ internal sealed class IotHandler : ConnectionHandler
     /// <summary>'T': temperature samples.</summary>
     private sealed record TemperatureMessage(TemperatureSample[] Samples, byte[] Signature) : DataMessage;
 
-    /// <summary>Unique, strictly increasing millisecond timestamp, used as the login challenge.</summary>
+    /// <summary>Unique, strictly increasing millisecond timestamp, so every login response (and data chain) differs.</summary>
     private static long NextServerTime()
     {
         long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -258,11 +262,16 @@ internal sealed class IotHandler : ConnectionHandler
         }
     }
 
-    private static void WriteLogin(PipeWriter output, long serverTime, byte[] signature)
+    private static async ValueTask WriteLoginResponseAsync(PipeWriter output, string deviceId, long serverTime, bool success,
+                                                           byte[] signature, CancellationToken ct)
     {
         var writer = new WireWriter(output);
+        writer.WriteByte((byte)'l');
+        writer.WriteLengthPrefixedString(deviceId);
         writer.WriteInt64(serverTime);
+        writer.WriteBoolean(success);
         writer.WriteLengthPrefixedBytes(signature);
+        await output.FlushAsync(ct);
     }
 }
 
@@ -288,22 +297,26 @@ internal sealed class DeviceSession
     /// <summary>Device clock minus server clock, measured at login.</summary>
     public long ClockOffsetMillis { get; set; }
 
-    public byte[] SignServerChallenge(long serverTime)
+    public bool VerifyLogin(long deviceTime, byte[] signature)
     {
         signed.ResetWrittenCount();
-        writer.WriteByte((byte)'S');
+        writer.WriteByte((byte)'L');
         writer.WriteLengthPrefixedString(DeviceId);
-        writer.WriteInt64(serverTime);
-        return HMACSHA256.HashData(key, signed.WrittenSpan);
-    }
-
-    public bool VerifyDeviceResponse(byte[] serverSig, long deviceTime, byte[] signature)
-    {
-        signed.ResetWrittenCount();
-        writer.WriteByte((byte)'D');
-        writer.WriteBytes(serverSig);
         writer.WriteInt64(deviceTime);
         return Accept(signature);
+    }
+
+    /// <summary>Signs the login response, chained to the received device signature; starts the data chain.</summary>
+    public byte[] SignLoginResponse(byte[] deviceSig, long serverTime, bool success)
+    {
+        signed.ResetWrittenCount();
+        writer.WriteBytes(deviceSig);
+        writer.WriteByte((byte)'l');
+        writer.WriteLengthPrefixedString(DeviceId);
+        writer.WriteInt64(serverTime);
+        writer.WriteBoolean(success);
+        lastSignature = HMACSHA256.HashData(key, signed.WrittenSpan);
+        return lastSignature;
     }
 
     public bool VerifyData(TemperatureSample[] samples, byte[] signature)

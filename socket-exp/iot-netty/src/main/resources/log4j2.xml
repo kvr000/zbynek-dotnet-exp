@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- shutdownHook disabled: IotServer's own hook logs the shutdown and then stops log4j itself -->
+<Configuration status="warn" shutdownHook="disable">
+	<Appenders>
+		<Console name="stderr" target="SYSTEM_ERR">
+			<PatternLayout pattern="%d{HH:mm:ss.SSS} %-5level %c{1}: %m%n%throwable"/>
+		</Console>
+	</Appenders>
+	<Loggers>
+		<Logger name="io.netty" level="warn"/>
+		<Root level="info">
+			<AppenderRef ref="stderr"/>
+		</Root>
+	</Loggers>
+</Configuration>
